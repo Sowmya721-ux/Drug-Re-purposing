@@ -7,4 +7,3 @@ rdkit
 py3Dmol
 openpyxl
 networkx
-.xlsx
