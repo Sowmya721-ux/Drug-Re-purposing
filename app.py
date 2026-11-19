@@ -451,7 +451,6 @@ with st.sidebar:
   target_weight = st.slider("Target Coverage Weight", 0.0, 1.0, 0.60, 0.05)
   chem_weight = round(1.0 - target_weight, 2)
   st.write(f"Chemical Similarity Weight: **{chem_weight:.2f}**")
-  top_3d_n = st.slider("Top Candidates in 3D View", 1, 5, 3)
 
 if uploaded_files:
   drugs_raw, disease_raw = split_uploaded_tables(uploaded_files)
@@ -572,7 +571,6 @@ if st.button("Run Screening", type="primary"):
         "selected_ref": selected_ref,
         "target_weight": target_weight,
         "chem_weight": chem_weight,
-        "top_3d_n": top_3d_n,
     }
 
 res = st.session_state.get("screening_result")
@@ -599,7 +597,7 @@ if res:
   st.pyplot(fig)
 
   st.subheader("4. Chemical structures")
-  render_side_by_side_3d(scored, ranked, selected_ref, top_n=res["top_3d_n"])
+  render_side_by_side_3d(scored, ranked, selected_ref, top_n=5)
 
   st.subheader("5. Best Route Finder (Drug → Target → Pathway / Disease)")
   graph = build_route_graph(scored, dt)
