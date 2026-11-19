@@ -37,6 +37,99 @@ TARGET_SYNONYMS = {
     "PGHS2": "PTGS2",
 }
 
+DRUG_COLUMN_ALIASES = {
+    "drug_name": [
+        "drug_name",
+        "drug",
+        "name",
+        "title",
+        "compound_name",
+        "molecule_name",
+        "generic_name",
+    ],
+    "smiles": [
+        "smiles",
+        "canonical_smiles",
+        "isomeric_smiles",
+        "structure_smiles",
+        "smiless",
+    ],
+    "targets": [
+        "targets",
+        "target",
+        "target_genes",
+        "gene_targets",
+        "gene_symbol",
+        "gene_symbols",
+        "genes",
+        "uniprot_gene",
+        "polypeptide_gene",
+        "associated_targets",
+    ],
+    "approval_status": [
+        "approval_status",
+        "status",
+        "groups",
+        "group",
+        "approval",
+        "clinical_status",
+    ],
+    "source": [
+        "source",
+        "drugbank_id",
+        "drugbank-id",
+        "db_id",
+        "id",
+        "database",
+    ],
+    "pdb_id": [
+        "pdb_id",
+        "pdb",
+        "pdb_ids",
+    ],
+}
+
+DISEASE_COLUMN_ALIASES = {
+    "disease": [
+        "disease",
+        "indication",
+        "indications",
+        "condition",
+        "conditions",
+        "disease_name",
+        "therapeutic_indication",
+    ],
+    "gene": [
+        "gene",
+        "gene_symbol",
+        "target",
+        "target_gene",
+        "targets",
+        "uniprot_gene",
+        "uniprot_id",
+        "polypeptide_gene",
+    ],
+    "pathway": [
+        "pathway",
+        "pathways",
+        "pathway_name",
+        "biological_pathway",
+        "mechanism",
+    ],
+    "association_score": [
+        "association_score",
+        "score",
+        "weight",
+        "confidence",
+        "evidence_score",
+    ],
+    "pdb_id": [
+        "pdb_id",
+        "pdb",
+        "pdb_ids",
+    ],
+}
+
 DEMO_DRUGS = pd.DataFrame(
     [
         ["Aspirin", "CC(=O)OC1=CC=CC=C1C(=O)O", "PTGS1;PTGS2", "Approved", "Built-in demo"],
@@ -62,6 +155,11 @@ def _txt(x) -> str:
   return "" if pd.isna(x) else str(x).strip()
 
 
+def _canon_col(name: str) -> str:
+  s = re.sub(r"[^a-z0-9]+", "_", str(name).strip().lower()).strip("_")
+  return s
+
+
 def _norm_gene(symbol: str) -> str:
   s = _txt(symbol).upper()
   return TARGET_SYNONYMS.get(s, s)
@@ -69,6 +167,20 @@ def _norm_gene(symbol: str) -> str:
 
 def _parse_targets(x) -> set[str]:
   return {_norm_gene(v) for v in re.split(r"[;,|]", _txt(x)) if _txt(v)}
+
+
+def _apply_column_aliases(df: pd.DataFrame, alias_map: dict[str, list[str]]) -> pd.DataFrame:
+  out = df.copy()
+  col_lookup = {_canon_col(c): c for c in out.columns}
+  for target_col, aliases in alias_map.items():
+    if target_col in out.columns:
+      continue
+    for alias in aliases:
+      matched_orig = col_lookup.get(_canon_col(alias))
+      if matched_orig is not None:
+        out[target_col] = out[matched_orig]
+        break
+  return out
 
 
 def parse_any_file_to_df(filename: str, content: bytes) -> pd.DataFrame:
@@ -89,7 +201,7 @@ def parse_any_file_to_df(filename: str, content: bytes) -> pd.DataFrame:
     if isinstance(data, list):
       return pd.DataFrame(data)
     if isinstance(data, dict):
-      for k in ("records", "data", "drugs", "diseases", "items"):
+      for k in ("records", "data", "drugs", "diseases", "indications", "items"):
         if k in data and isinstance(data[k], list):
           return pd.DataFrame(data[k])
       return pd.DataFrame(data)
@@ -118,13 +230,22 @@ def split_uploaded_tables(uploaded_files):
 
   drugs_raw, disease_raw = None, None
   for fname, df in parsed:
-    cols = {c.lower() for c in df.columns}
-    if {"drug_name", "smiles", "targets"} & cols or "drug" in fname.lower():
-      if drugs_raw is None:
-        drugs_raw = df.copy()
-    if {"disease", "gene"} & cols or "disease" in fname.lower():
-      if disease_raw is None:
-        disease_raw = df.copy()
+    mapped_d = _apply_column_aliases(df, DRUG_COLUMN_ALIASES)
+    mapped_dt = _apply_column_aliases(df, DISEASE_COLUMN_ALIASES)
+    d_cols = set(mapped_d.columns)
+    dt_cols = set(mapped_dt.columns)
+
+    has_drug_signal = bool({"drug_name", "smiles", "targets"} & d_cols) or any(
+        k in fname.lower() for k in ("drug", "compound", "chembl", "pubchem")
+    )
+    has_disease_signal = bool({"disease", "gene"} & dt_cols) or any(
+        k in fname.lower() for k in ("disease", "indication", "drugbank", "pathway")
+    )
+
+    if has_drug_signal and drugs_raw is None:
+      drugs_raw = mapped_d
+    if has_disease_signal and disease_raw is None:
+      disease_raw = mapped_dt
 
   if len(parsed) == 1:
     _, df = parsed[0]
@@ -137,16 +258,16 @@ def split_uploaded_tables(uploaded_files):
           "source": "Uploaded file",
       })
     elif drugs_raw is None:
-      drugs_raw = df.copy()
+      drugs_raw = _apply_column_aliases(df, DRUG_COLUMN_ALIASES)
     if disease_raw is None:
-      disease_raw = df.copy()
+      disease_raw = _apply_column_aliases(df, DISEASE_COLUMN_ALIASES)
 
   return drugs_raw, disease_raw
 
 
 def ensure_schemas(drugs_raw: pd.DataFrame, disease_raw: pd.DataFrame):
-  d_df = drugs_raw.copy()
-  dt_df = disease_raw.copy()
+  d_df = _apply_column_aliases(drugs_raw, DRUG_COLUMN_ALIASES)
+  dt_df = _apply_column_aliases(disease_raw, DISEASE_COLUMN_ALIASES)
 
   if "drug_name" not in d_df.columns and len(d_df.columns) > 0:
     d_df["drug_name"] = d_df[d_df.columns[0]]
@@ -448,9 +569,9 @@ with st.sidebar:
   )
 
   st.header("2. Scoring Weights")
-  target_weight = st.slider("Target Coverage Weight", 0.0, 1.0, 0.60, 0.05)
-  chem_weight = round(1.0 - target_weight, 2)
-  st.write(f"Chemical Similarity Weight: **{chem_weight:.2f}**")
+  chem_weight = st.slider("Chemical Similarity Weight", 0.0, 1.0, 0.40, 0.05)
+  target_weight = round(1.0 - chem_weight, 2)
+  st.write(f"Target Coverage Weight: **{target_weight:.2f}**")
 
 if uploaded_files:
   drugs_raw, disease_raw = split_uploaded_tables(uploaded_files)
@@ -500,137 +621,4 @@ if st.button("Run Screening", type="primary"):
     fpgen = rdFingerprintGenerator.GetMorganGenerator(radius=2, fpSize=2048)
     drugs["mol"] = drugs["smiles"].map(lambda s: Chem.MolFromSmiles(s) if s else None)
     drugs["fingerprint"] = drugs["mol"].map(
-        lambda m: fpgen.GetFingerprint(m) if m is not None else None
-    )
-
-    ref_fp = drugs.loc[drugs["drug_name"].eq(selected_ref), "fingerprint"].iloc[0]
-    if ref_fp is None:
-      drugs["chemical_similarity"] = np.nan
-    else:
-      drugs["chemical_similarity"] = drugs["fingerprint"].map(
-          lambda fp: float(DataStructs.TanimotoSimilarity(ref_fp, fp)) if fp is not None else np.nan
-      )
-
-    d_sub = (
-        dt[dt["disease"].eq(selected_disease)]
-        .groupby("gene", as_index=False)
-        .agg(
-            association_score=("association_score", "max"),
-            pathway=("pathway", lambda s: "; ".join(sorted({v for v in s if v}))),
-            pdb_id=("pdb_id", lambda s: next((v for v in s if v), "")),
-        )
-    )
-    gene_weights = dict(zip(d_sub["gene"], d_sub["association_score"]))
-    total_w = sum(gene_weights.values())
-
-    matched_rows = []
-    for tset in drugs["targets_set"]:
-      matched = sorted(tset & set(gene_weights))
-      w_hit = sum(gene_weights[g] for g in matched)
-      matched_rows.append({
-          "matched_targets": "; ".join(matched),
-          "matched_target_count": len(matched),
-          "target_coverage": (w_hit / total_w) if total_w else 0.0,
-      })
-
-    scored = pd.concat([drugs.reset_index(drop=True), pd.DataFrame(matched_rows)], axis=1)
-    physicochem_df = build_physicochemical_table(scored)
-
-    st.session_state["screening_result"] = {
-        "scored": scored,
-        "dt": dt,
-        "physicochem_df": physicochem_df,
-        "selected_disease": selected_disease,
-        "selected_ref": selected_ref,
-        "gene_target_count": len(gene_weights),
-    }
-
-res = st.session_state.get("screening_result")
-if res:
-  scored = res["scored"]
-  dt = res["dt"]
-  physicochem_df = res["physicochem_df"]
-  selected_disease = res["selected_disease"]
-  selected_ref = res["selected_ref"]
-
-  cands = scored[scored["drug_name"].ne(selected_ref)].copy()
-  cands["screening_score"] = np.where(
-      cands["chemical_similarity"].isna(),
-      cands["target_coverage"],
-      target_weight * cands["target_coverage"] + chem_weight * cands["chemical_similarity"],
-  )
-  ranked = cands.sort_values(
-      ["screening_score", "target_coverage", "chemical_similarity"],
-      ascending=False,
-      na_position="last",
-  ).reset_index(drop=True)
-  ranked.insert(0, "rank", np.arange(1, len(ranked) + 1))
-
-  provenance_df = pd.DataFrame([{
-      "timestamp_utc": datetime.datetime.now(datetime.timezone.utc).isoformat(),
-      "disease": selected_disease,
-      "reference_drug": selected_ref,
-      "target_weight": target_weight,
-      "chemical_weight": chem_weight,
-      "fingerprint": "Morgan(radius=2, nBits=2048)",
-      "drugs_screened": len(ranked),
-      "disease_targets": res["gene_target_count"],
-      "top_candidate": ranked.iloc[0]["drug_name"] if len(ranked) else "None",
-      "disclaimer": "Computational research shortlist only; experimental/clinical validation required.",
-  }])
-
-  st.subheader("1. Ranked Candidates")
-  st.dataframe(
-      ranked[["rank", "drug_name", "chemical_similarity", "target_coverage", "screening_score", "matched_targets"]],
-      use_container_width=True,
-  )
-
-  st.subheader("2. Physicochemical & Lipinski Properties")
-  st.dataframe(physicochem_df, use_container_width=True)
-
-  st.subheader("3. Diagnostic Charts")
-  fig = make_charts(ranked, selected_ref, selected_disease, target_weight, chem_weight)
-  st.pyplot(fig)
-
-  st.subheader("4. Chemical structures")
-  render_side_by_side_3d(scored, ranked, selected_ref, top_n=5)
-
-  st.subheader("5. Best Route Finder (Drug → Target → Pathway / Disease)")
-  graph = build_route_graph(scored, dt)
-  all_nodes = sorted(graph.nodes)
-  if all_nodes:
-    r_col1, r_col2 = st.columns(2)
-    default_src = ranked.iloc[0]["drug_name"] if len(ranked) else all_nodes[0]
-    src_idx = all_nodes.index(default_src) if default_src in all_nodes else 0
-    tgt_idx = all_nodes.index(selected_disease) if selected_disease in all_nodes else 0
-    with r_col1:
-      src_node = st.selectbox("Source Node", all_nodes, index=src_idx, key="route_src")
-    with r_col2:
-      tgt_node = st.selectbox("Target Node", all_nodes, index=tgt_idx, key="route_tgt")
-
-    route_info = find_best_route(graph, src_node, tgt_node)
-    if route_info["found"]:
-      st.success(f"**Best Route:** {' → '.join(route_info['route'])} (Total Cost: `{route_info['total_cost']}`)")
-      st.dataframe(pd.DataFrame(route_info["steps"]), use_container_width=True)
-    else:
-      st.info("No directed route connects the selected source and target nodes.")
-
-  st.subheader("6. Run Provenance & Download Bundle")
-  st.dataframe(provenance_df, use_container_width=True)
-
-  zip_buf = io.BytesIO()
-  with zipfile.ZipFile(zip_buf, "w", zipfile.ZIP_DEFLATED) as zf:
-    zf.writestr(
-        "LITMUS_ranked_candidates.csv",
-        ranked[["rank", "drug_name", "smiles", "approval_status", "source", "chemical_similarity", "target_coverage", "screening_score", "matched_targets"]].to_csv(index=False),
-    )
-    zf.writestr("LITMUS_physicochemical_properties.csv", physicochem_df.to_csv(index=False))
-    zf.writestr("LITMUS_run_provenance.csv", provenance_df.to_csv(index=False))
-  zip_buf.seek(0)
-
-  st.download_button(
-      label="Download Results Bundle (.ZIP)",
-      data=zip_buf,
-      file_name="LITMUS_research_bundle.zip",
-      mime="application/zip",
-  )
+        lambda m: fpgen.Get
