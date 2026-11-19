@@ -376,3 +376,124 @@ def build_route_graph(drugs_df: pd.DataFrame, dt_df: pd.DataFrame) -> nx.DiGraph
   for r in drugs_df.itertuples():
     drug = _txt(getattr(r, "drug_name", ""))
     if not drug:
+      continue
+    g.add_node(drug, node_type="drug")
+    for gene in getattr(r, "targets_set", set()) or set():
+      gene_c = _norm_gene(gene)
+      if gene_c:
+        g.add_node(gene_c, node_type="gene")
+        g.add_edge(drug, gene_c, weight=1.0, distance=1.0, relation="targets")
+
+  for r in dt_df.itertuples():
+    gene = _norm_gene(getattr(r, "gene", ""))
+    disease = _txt(getattr(r, "disease", ""))
+    pathway = _txt(getattr(r, "pathway", ""))
+    assoc = max(0.01, min(1.0, float(getattr(r, "association_score", 1.0) or 1.0)))
+    cost = round(1.0 / assoc, 4)
+
+    if gene and pathway:
+      g.add_node(gene, node_type="gene")
+      g.add_node(pathway, node_type="pathway")
+      g.add_edge(gene, pathway, weight=assoc, distance=cost, relation="in_pathway")
+    if pathway and disease:
+      g.add_node(pathway, node_type="pathway")
+      g.add_node(disease, node_type="disease")
+      g.add_edge(pathway, disease, weight=assoc, distance=cost, relation="linked_to_disease")
+    if gene and disease:
+      g.add_node(gene, node_type="gene")
+      g.add_node(disease, node_type="disease")
+      g.add_edge(gene, disease, weight=assoc, distance=cost, relation="associated_with")
+  return g
+
+
+def find_best_route(g: nx.DiGraph, source: str, target: str) -> dict:
+  if source not in g or target not in g:
+    return {"found": False, "route": [], "total_cost": None, "steps": []}
+  try:
+    path = nx.shortest_path(g, source=source, target=target, weight="distance")
+    total_cost = nx.shortest_path_length(g, source=source, target=target, weight="distance")
+    steps = []
+    for u, v in zip(path[:-1], path[1:]):
+      ed = g.get_edge_data(u, v, default={})
+      steps.append({
+          "from": u,
+          "to": v,
+          "relation": ed.get("relation", ""),
+          "weight": ed.get("weight", 1.0),
+          "distance": ed.get("distance", 1.0),
+      })
+    return {"found": True, "route": path, "total_cost": round(float(total_cost), 4), "steps": steps}
+  except nx.NetworkXNoPath:
+    return {"found": False, "route": [], "total_cost": None, "steps": []}
+
+
+# ==============================================================================
+# UI & EXECUTION
+# ==============================================================================
+st.title("🧪 Drug Repurposing")
+st.caption(
+    "Upload any dataset format or use built-in demo data to rank candidates,"
+    " inspect Lipinski descriptors, view diagnostic charts, and rotate 3D conformers side by side."
+)
+
+with st.sidebar:
+  st.header("1. Data Input")
+  uploaded_files = st.file_uploader(
+      "Upload drug & disease files (any format)",
+      accept_multiple_files=True,
+  )
+  use_demo = st.checkbox(
+      "Use built-in demo data when no files uploaded",
+      value=True,
+  )
+
+  st.header("2. Scoring Weights")
+  target_weight = st.slider("Target Coverage Weight", 0.0, 1.0, 0.60, 0.05)
+  chem_weight = round(1.0 - target_weight, 2)
+  st.write(f"Chemical Similarity Weight: **{chem_weight:.2f}**")
+  top_3d_n = st.slider("Top Candidates in 3D View", 1, 5, 3)
+
+if uploaded_files:
+  drugs_raw, disease_raw = split_uploaded_tables(uploaded_files)
+  drugs_raw, disease_raw = ensure_schemas(drugs_raw, disease_raw)
+elif use_demo:
+  drugs_raw, disease_raw = DEMO_DRUGS.copy(), DEMO_DISEASE.copy()
+else:
+  st.warning("Upload at least one file or enable built-in demo data in the sidebar.")
+  st.stop()
+
+drugs = drugs_raw.copy()
+drugs["drug_name"] = drugs["drug_name"].map(_txt)
+drugs["smiles"] = drugs["smiles"].map(_txt)
+drugs["targets_set"] = drugs["targets"].map(_parse_targets)
+drugs = drugs[drugs["drug_name"].ne("")].drop_duplicates("drug_name").reset_index(drop=True)
+
+dt = disease_raw.copy()
+dt["disease"] = dt["disease"].map(_txt)
+dt["gene"] = dt["gene"].map(_norm_gene)
+dt["pathway"] = dt["pathway"].map(_txt)
+dt["pdb_id"] = dt["pdb_id"].map(lambda v: _txt(v).upper())
+dt["association_score"] = (
+    pd.to_numeric(dt["association_score"], errors="coerce").fillna(1.0).clip(0.0, 1.0)
+)
+dt = dt[dt["disease"].ne("") & dt["gene"].ne("")].drop_duplicates(["disease", "gene", "pathway"]).reset_index(drop=True)
+
+if drugs.empty or dt.empty:
+  st.error("No valid drug or disease-target rows found after parsing.")
+  st.stop()
+
+diseases = sorted(dt["disease"].unique())
+drug_list = sorted(drugs["drug_name"].tolist())
+default_ref_idx = drug_list.index("Diclofenac") if "Diclofenac" in drug_list else 0
+
+col_a, col_b = st.columns(2)
+with col_a:
+  selected_disease = st.selectbox("Target Disease", diseases)
+with col_b:
+  selected_ref = st.selectbox("Reference Drug", drug_list, index=default_ref_idx)
+
+if st.button("Run Screening", type="primary"):
+  with st.spinner("Retrieving structures, computing fingerprints, and ranking candidates..."):
+    for i in drugs.index:
+      if not drugs.loc[i, "smiles"]:
+        drugs
