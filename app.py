@@ -1,28 +1,33 @@
-!pip install -q rdkit py3Dmol
-
 import datetime
 import io
 import json
-import os
 import re
 import zipfile
+import networkx as nx
 import numpy as np
 import pandas as pd
 import requests
 import matplotlib.pyplot as plt
 import py3Dmol
-import ipywidgets as widgets
-from IPython.display import display, HTML, clear_output
+import streamlit as st
+import streamlit.components.v1 as components
 from rdkit import Chem, DataStructs
-from rdkit.Chem import AllChem, Crippen, Descriptors, Lipinski, rdFingerprintGenerator, rdMolDescriptors
+from rdkit.Chem import (
+    AllChem,
+    Crippen,
+    Descriptors,
+    Lipinski,
+    rdFingerprintGenerator,
+    rdMolDescriptors,
+)
 
-# ==============================================================================
-# 1. CONFIGURATION, GENE SYNONYMS & SHARED STATE
-# ==============================================================================
-TARGET_WEIGHT = 0.60
-CHEMICAL_WEIGHT = 0.40
+st.set_page_config(
+    page_title="Virtual Screening & 3D Structure Explorer",
+    page_icon="🧪",
+    layout="wide",
+)
+
 RANDOM_SEED = 42
-
 TARGET_SYNONYMS = {
     "COX1": "PTGS1",
     "COX-1": "PTGS1",
@@ -32,8 +37,25 @@ TARGET_SYNONYMS = {
     "PGHS2": "PTGS2",
 }
 
-upload_state = {"files": {}}
-pipeline_outputs = {}
+DEMO_DRUGS = pd.DataFrame(
+    [
+        ["Aspirin", "CC(=O)OC1=CC=CC=C1C(=O)O", "PTGS1;PTGS2", "Approved", "Built-in demo"],
+        ["Ibuprofen", "CC(C)CC1=CC=C(C=C1)C(C)C(=O)O", "PTGS1;PTGS2", "Approved", "Built-in demo"],
+        ["Naproxen", "CC(C1=CC2=C(C=C1)C=C(C=C2)OC)C(=O)O", "PTGS1;PTGS2", "Approved", "Built-in demo"],
+        ["Diclofenac", "C1=CC=C(C(=C1)CC(=O)O)NC2=C(C=CC=C2Cl)Cl", "PTGS1;PTGS2", "Approved", "Built-in demo"],
+        ["Celecoxib", "CC1=CC=C(C=C1)C2=CC(=NN2C3=CC=C(C=C3)S(=O)(=O)N)C(F)(F)F", "PTGS2", "Approved", "Built-in demo"],
+        ["Indomethacin", "CC1=C(C2=C(N1C(=O)C3=CC=C(C=C3)Cl)C=CC(=C2)OC)CC(=O)O", "PTGS1;PTGS2", "Approved", "Built-in demo"],
+    ],
+    columns=["drug_name", "smiles", "targets", "approval_status", "source"],
+)
+
+DEMO_DISEASE = pd.DataFrame(
+    [
+        ["Inflammation (demo)", "PTGS1", "Arachidonic acid / prostaglandin synthesis", 0.90, ""],
+        ["Inflammation (demo)", "PTGS2", "Arachidonic acid / prostaglandin synthesis", 0.95, ""],
+    ],
+    columns=["disease", "gene", "pathway", "association_score", "pdb_id"],
+)
 
 
 def _txt(x) -> str:
@@ -49,9 +71,6 @@ def _parse_targets(x) -> set[str]:
   return {_norm_gene(v) for v in re.split(r"[;,|]", _txt(x)) if _txt(v)}
 
 
-# ==============================================================================
-# 2. UNIVERSAL FILE PARSER & SCHEMA NORMALIZER
-# ==============================================================================
 def parse_any_file_to_df(filename: str, content: bytes) -> pd.DataFrame:
   lower = filename.lower()
   buf = io.BytesIO(content)
@@ -90,12 +109,12 @@ def parse_any_file_to_df(filename: str, content: bytes) -> pd.DataFrame:
   return pd.DataFrame({"raw_entry": lines})
 
 
-def split_uploaded_tables(uploaded_map: dict[str, bytes]):
+def split_uploaded_tables(uploaded_files):
   parsed = []
-  for fname, content in uploaded_map.items():
-    df = parse_any_file_to_df(fname, content)
+  for f in uploaded_files:
+    df = parse_any_file_to_df(f.name, f.getvalue())
     df.columns = [str(c).strip() for c in df.columns]
-    parsed.append((fname, df))
+    parsed.append((f.name, df))
 
   drugs_raw, disease_raw = None, None
   for fname, df in parsed:
@@ -125,7 +144,7 @@ def split_uploaded_tables(uploaded_map: dict[str, bytes]):
   return drugs_raw, disease_raw
 
 
-def _ensure_schemas(drugs_raw: pd.DataFrame, disease_raw: pd.DataFrame):
+def ensure_schemas(drugs_raw: pd.DataFrame, disease_raw: pd.DataFrame):
   d_df = drugs_raw.copy()
   dt_df = disease_raw.copy()
 
@@ -166,9 +185,7 @@ def _ensure_schemas(drugs_raw: pd.DataFrame, disease_raw: pd.DataFrame):
   return d_df, dt_df
 
 
-# ==============================================================================
-# 3. MOLECULES, PHYSICOCHEMICAL DESCRIPTORS, CHARTS & TRANSPARENT 3D VIEW
-# ==============================================================================
+@st.cache_data(show_spinner=False)
 def fetch_smiles_pubchem(name: str) -> str:
   url = (
       "https://pubchem.ncbi.nlm.nih.gov/rest/pug/compound/name/"
@@ -176,7 +193,7 @@ def fetch_smiles_pubchem(name: str) -> str:
       + "/property/CanonicalSMILES,IsomericSMILES/JSON"
   )
   try:
-    r = requests.get(url, timeout=25)
+    r = requests.get(url, timeout=20)
     if r.status_code == 200:
       props = r.json()["PropertyTable"]["Properties"][0]
       return props.get("CanonicalSMILES") or props.get("ConnectivitySMILES") or ""
@@ -211,18 +228,14 @@ def build_physicochemical_table(scored_df: pd.DataFrame) -> pd.DataFrame:
   return pd.DataFrame(rows)
 
 
-def plot_researcher_charts(
+def make_charts(
     ranked_df: pd.DataFrame,
     reference_drug: str,
     disease_choice: str,
-    target_weight: float = TARGET_WEIGHT,
-    chem_weight: float = CHEMICAL_WEIGHT,
+    target_weight: float,
+    chem_weight: float,
 ):
-  if ranked_df.empty:
-    print("No ranked candidates available to plot.")
-    return
-
-  fig, axes = plt.subplots(1, 2, figsize=(12, 4.5))
+  fig, axes = plt.subplots(1, 2, figsize=(12, 4.4))
   cov = ranked_df["target_coverage"].fillna(0.0).to_numpy()
   sim = ranked_df["chemical_similarity"].fillna(0.0).to_numpy()
   c_part = target_weight * cov
@@ -230,10 +243,7 @@ def plot_researcher_charts(
   y_pos = np.arange(len(ranked_df))
 
   axes[0].barh(
-      y_pos,
-      c_part,
-      color="#2a9d8f",
-      label=f"{target_weight:.2f} × Target Coverage",
+      y_pos, c_part, color="#2a9d8f", label=f"{target_weight:.2f} × Target Coverage"
   )
   axes[0].barh(
       y_pos,
@@ -251,8 +261,7 @@ def plot_researcher_charts(
   axes[0].legend(loc="lower right", fontsize=8)
   axes[0].grid(axis="x", linestyle="--", alpha=0.4)
 
-  valid_mask = ranked_df["chemical_similarity"].notna()
-  sub = ranked_df[valid_mask]
+  sub = ranked_df[ranked_df["chemical_similarity"].notna()]
   axes[1].scatter(
       sub["chemical_similarity"],
       sub["target_coverage"],
@@ -276,10 +285,10 @@ def plot_researcher_charts(
   axes[1].grid(True, linestyle="--", alpha=0.4)
 
   plt.tight_layout()
-  plt.show()
+  return fig
 
 
-def _build_3d_sdf_block(mol) -> str | None:
+def build_3d_sdf_block(mol) -> str | None:
   if mol is None:
     return None
   try:
@@ -294,35 +303,25 @@ def _build_3d_sdf_block(mol) -> str | None:
   return None
 
 
-def _render_side_by_side_3d_no_bg(
-    scored_df: pd.DataFrame,
-    ranked_df: pd.DataFrame,
-    selected_ref: str,
-    top_n: int = 3,
+def render_side_by_side_3d(
+    scored_df: pd.DataFrame, ranked_df: pd.DataFrame, selected_ref: str, top_n: int = 3
 ):
   mol_map = dict(zip(scored_df["drug_name"], scored_df["mol"]))
-  sim_map = (
-      dict(zip(ranked_df["drug_name"], ranked_df["chemical_similarity"]))
-      if "chemical_similarity" in ranked_df.columns
-      else {}
-  )
-
+  sim_map = dict(zip(ranked_df["drug_name"], ranked_df["chemical_similarity"]))
   names_3d = [selected_ref] + [
       n for n in ranked_df["drug_name"].head(top_n).tolist() if n != selected_ref
   ]
 
-  cards_html = []
+  cards = []
   for name in names_3d:
-    sdf_block = _build_3d_sdf_block(mol_map.get(name))
+    sdf_block = build_3d_sdf_block(mol_map.get(name))
     if not sdf_block:
-      print(f"Skipping 3D view for {name}: 3D conformer could not be generated.")
       continue
-
     role = "Reference" if name == selected_ref else "Candidate"
     sim = sim_map.get(name)
     sim_str = f" | Sim: {sim:.2f}" if sim is not None and sim == sim else ""
 
-    v = py3Dmol.view(width=320, height=260)
+    v = py3Dmol.view(width=300, height=250)
     v.addModel(sdf_block, "sdf")
     v.setStyle({
         "stick": {"radius": 0.18, "colorscheme": "Jmol"},
@@ -330,131 +329,158 @@ def _render_side_by_side_3d_no_bg(
     })
     v.setBackgroundColor("white", 0.0)
     v.zoomTo()
-
     viewer_html = v._make_html()
-    card = (
-        "<div style='display:inline-block; margin:6px 10px; "
-        "background:transparent; vertical-align:top;'>"
-        "<div style='text-align:center; font-size:12px; margin-bottom:4px; "
-        "background:transparent;'>"
+
+    cards.append(
+        f"<div style='width:315px; background:transparent; padding:4px;'>"
+        f"<div style='text-align:center; font-size:12px; margin-bottom:4px; background:transparent;'>"
         f"<b>{role}: {name}</b>{sim_str}<br>"
-        "<span style='opacity:0.75;'>Drag to rotate · Scroll to zoom</span>"
-        "</div>"
+        f"<span style='opacity:0.75;'>Drag to rotate · Scroll to zoom</span></div>"
         f"<div style='background:transparent;'>{viewer_html}</div>"
-        "</div>"
+        f"</div>"
     )
-    cards_html.append(card)
 
-  if cards_html:
-    container = (
-        "<div style='display:flex; flex-wrap:wrap; align-items:flex-start; "
-        "background:transparent;'>"
-        + "".join(cards_html)
-        + "</div>"
-    )
-    display(HTML(container))
-  else:
-    print("No 3D conformers could be generated for display.")
+  if not cards:
+    st.info("No 3D conformers could be generated for display.")
+    return
+
+  full_html = (
+      "<div style='display:flex; flex-wrap:wrap; gap:10px; background:transparent;'>"
+      + "".join(cards)
+      + "</div>"
+  )
+  components.html(full_html, height=320, scrolling=False)
 
 
-def _export_results(
-    ranked_df: pd.DataFrame,
-    physicochem_df: pd.DataFrame,
-    provenance_df: pd.DataFrame,
-):
-  ranked_df.to_csv("LITMUS_ranked_candidates.csv", index=False)
-  physicochem_df.to_csv("LITMUS_physicochemical_properties.csv", index=False)
-  provenance_df.to_csv("LITMUS_run_provenance.csv", index=False)
+def build_route_graph(drugs_df: pd.DataFrame, dt_df: pd.DataFrame) -> nx.DiGraph:
+  g = nx.DiGraph()
+  for r in drugs_df.itertuples():
+    drug = _txt(getattr(r, "drug_name", ""))
+    if not drug:
+      continue
+    g.add_node(drug, node_type="drug")
+    for gene in getattr(r, "targets_set", set()) or set():
+      gene_c = _norm_gene(gene)
+      if gene_c:
+        g.add_node(gene_c, node_type="gene")
+        g.add_edge(drug, gene_c, weight=1.0, distance=1.0, relation="targets")
 
-  zip_name = "LITMUS_research_bundle.zip"
-  with zipfile.ZipFile(zip_name, "w", zipfile.ZIP_DEFLATED) as zf:
-    for fname in [
-        "LITMUS_ranked_candidates.csv",
-        "LITMUS_physicochemical_properties.csv",
-        "LITMUS_run_provenance.csv",
-    ]:
-      if os.path.exists(fname):
-        zf.write(fname)
-  print(f"Exported CSVs and bundle: {zip_name}")
+  for r in dt_df.itertuples():
+    gene = _norm_gene(getattr(r, "gene", ""))
+    disease = _txt(getattr(r, "disease", ""))
+    pathway = _txt(getattr(r, "pathway", ""))
+    assoc = max(0.01, min(1.0, float(getattr(r, "association_score", 1.0) or 1.0)))
+    cost = round(1.0 / assoc, 4)
+
+    if gene and pathway:
+      g.add_node(gene, node_type="gene")
+      g.add_node(pathway, node_type="pathway")
+      g.add_edge(gene, pathway, weight=assoc, distance=cost, relation="in_pathway")
+    if pathway and disease:
+      g.add_node(pathway, node_type="pathway")
+      g.add_node(disease, node_type="disease")
+      g.add_edge(pathway, disease, weight=assoc, distance=cost, relation="linked_to_disease")
+    if gene and disease:
+      g.add_node(gene, node_type="gene")
+      g.add_node(disease, node_type="disease")
+      g.add_edge(gene, disease, weight=assoc, distance=cost, relation="associated_with")
+  return g
+
+
+def find_best_route(g: nx.DiGraph, source: str, target: str) -> dict:
+  if source not in g or target not in g:
+    return {"found": False, "route": [], "total_cost": None, "steps": []}
+  try:
+    path = nx.shortest_path(g, source=source, target=target, weight="distance")
+    total_cost = nx.shortest_path_length(g, source=source, target=target, weight="distance")
+    steps = []
+    for u, v in zip(path[:-1], path[1:]):
+      ed = g.get_edge_data(u, v, default={})
+      steps.append({
+          "from": u,
+          "to": v,
+          "relation": ed.get("relation", ""),
+          "weight": ed.get("weight", 1.0),
+          "distance": ed.get("distance", 1.0),
+      })
+    return {"found": True, "route": path, "total_cost": round(float(total_cost), 4), "steps": steps}
+  except nx.NetworkXNoPath:
+    return {"found": False, "route": [], "total_cost": None, "steps": []}
 
 
 # ==============================================================================
-# 4. MAIN SCREENING PIPELINE & UPLOAD WIDGET UI
+# UI & EXECUTION
 # ==============================================================================
-def run_screening_from_uploads(
-    disease_choice: str = "",
-    reference_drug: str = "",
-    out_widget: widgets.Output | None = None,
-):
-  target_out = out_widget if out_widget is not None else widgets.Output()
-  if out_widget is None:
-    display(target_out)
+st.title("🧪 Virtual Screening & 3D Structure Explorer")
+st.caption(
+    "Upload any dataset format or use built-in demo data to rank candidates,"
+    " inspect Lipinski descriptors, view diagnostic charts, and rotate 3D conformers side by side."
+)
 
-  with target_out:
-    clear_output(wait=True)
-    if not upload_state["files"]:
-      print(
-          "No files uploaded yet. Click 'Upload File(s)' first, then click"
-          " 'Run Screening'."
-      )
-      return
+with st.sidebar:
+  st.header("1. Data Input")
+  uploaded_files = st.file_uploader(
+      "Upload drug & disease files (any format)",
+      accept_multiple_files=True,
+  )
+  use_demo = st.checkbox(
+      "Use built-in demo data when no files uploaded",
+      value=True,
+  )
 
-    drugs_raw, disease_raw = split_uploaded_tables(upload_state["files"])
-    if drugs_raw is None or disease_raw is None:
-      print("Could not separate drug and disease-target tables.")
-      return
+  st.header("2. Scoring Weights")
+  target_weight = st.slider("Target Coverage Weight", 0.0, 1.0, 0.60, 0.05)
+  chem_weight = round(1.0 - target_weight, 2)
+  st.write(f"Chemical Similarity Weight: **{chem_weight:.2f}**")
+  top_3d_n = st.slider("Top Candidates in 3D View", 1, 5, 3)
 
-    drugs_raw, disease_raw = _ensure_schemas(drugs_raw, disease_raw)
+if uploaded_files:
+  drugs_raw, disease_raw = split_uploaded_tables(uploaded_files)
+  drugs_raw, disease_raw = ensure_schemas(drugs_raw, disease_raw)
+elif use_demo:
+  drugs_raw, disease_raw = DEMO_DRUGS.copy(), DEMO_DISEASE.copy()
+else:
+  st.warning("Upload at least one file or enable built-in demo data in the sidebar.")
+  st.stop()
 
-    drugs = drugs_raw.copy()
-    drugs["drug_name"] = drugs["drug_name"].map(_txt)
-    drugs["smiles"] = drugs["smiles"].map(_txt)
-    drugs["targets_set"] = drugs["targets"].map(_parse_targets)
-    drugs = (
-        drugs[drugs["drug_name"].ne("")]
-        .drop_duplicates("drug_name")
-        .reset_index(drop=True)
-    )
+drugs = drugs_raw.copy()
+drugs["drug_name"] = drugs["drug_name"].map(_txt)
+drugs["smiles"] = drugs["smiles"].map(_txt)
+drugs["targets_set"] = drugs["targets"].map(_parse_targets)
+drugs = drugs[drugs["drug_name"].ne("")].drop_duplicates("drug_name").reset_index(drop=True)
 
-    dt = disease_raw.copy()
-    dt["disease"] = dt["disease"].map(_txt)
-    dt["gene"] = dt["gene"].map(_norm_gene)
-    dt["pathway"] = dt["pathway"].map(_txt)
-    dt["pdb_id"] = dt["pdb_id"].map(lambda v: _txt(v).upper())
-    dt["association_score"] = (
-        pd.to_numeric(dt["association_score"], errors="coerce")
-        .fillna(1.0)
-        .clip(0.0, 1.0)
-    )
-    dt = (
-        dt[dt["disease"].ne("") & dt["gene"].ne("")]
-        .drop_duplicates(["disease", "gene", "pathway"])
-        .reset_index(drop=True)
-    )
+dt = disease_raw.copy()
+dt["disease"] = dt["disease"].map(_txt)
+dt["gene"] = dt["gene"].map(_norm_gene)
+dt["pathway"] = dt["pathway"].map(_txt)
+dt["pdb_id"] = dt["pdb_id"].map(lambda v: _txt(v).upper())
+dt["association_score"] = (
+    pd.to_numeric(dt["association_score"], errors="coerce").fillna(1.0).clip(0.0, 1.0)
+)
+dt = dt[dt["disease"].ne("") & dt["gene"].ne("")].drop_duplicates(["disease", "gene", "pathway"]).reset_index(drop=True)
 
-    if drugs.empty or dt.empty:
-      print("Parsed tables have 0 valid rows.")
-      return
+if drugs.empty or dt.empty:
+  st.error("No valid drug or disease-target rows found after parsing.")
+  st.stop()
 
-    diseases = sorted(dt["disease"].unique())
-    selected_disease = (
-        disease_choice if disease_choice in diseases else diseases[0]
-    )
+diseases = sorted(dt["disease"].unique())
+drug_list = sorted(drugs["drug_name"].tolist())
+default_ref_idx = drug_list.index("Diclofenac") if "Diclofenac" in drug_list else 0
 
-    drug_list = sorted(drugs["drug_name"].tolist())
-    default_ref = "Ibuprofen" if "Ibuprofen" in drug_list else drug_list[0]
-    selected_ref = reference_drug if reference_drug in drug_list else default_ref
+col_a, col_b = st.columns(2)
+with col_a:
+  selected_disease = st.selectbox("Target Disease", diseases)
+with col_b:
+  selected_ref = st.selectbox("Reference Drug", drug_list, index=default_ref_idx)
 
-    print(f"Disease: {selected_disease} | Reference Drug: {selected_ref}")
-
+if st.button("Run Screening", type="primary"):
+  with st.spinner("Retrieving structures, computing fingerprints, and ranking candidates..."):
     for i in drugs.index:
       if not drugs.loc[i, "smiles"]:
         drugs.loc[i, "smiles"] = fetch_smiles_pubchem(drugs.loc[i, "drug_name"])
 
     fpgen = rdFingerprintGenerator.GetMorganGenerator(radius=2, fpSize=2048)
-    drugs["mol"] = drugs["smiles"].map(
-        lambda s: Chem.MolFromSmiles(s) if s else None
-    )
+    drugs["mol"] = drugs["smiles"].map(lambda s: Chem.MolFromSmiles(s) if s else None)
     drugs["fingerprint"] = drugs["mol"].map(
         lambda m: fpgen.GetFingerprint(m) if m is not None else None
     )
@@ -464,11 +490,7 @@ def run_screening_from_uploads(
       drugs["chemical_similarity"] = np.nan
     else:
       drugs["chemical_similarity"] = drugs["fingerprint"].map(
-          lambda fp: (
-              float(DataStructs.TanimotoSimilarity(ref_fp, fp))
-              if fp is not None
-              else np.nan
-          )
+          lambda fp: float(DataStructs.TanimotoSimilarity(ref_fp, fp)) if fp is not None else np.nan
       )
 
     d_sub = (
@@ -476,10 +498,7 @@ def run_screening_from_uploads(
         .groupby("gene", as_index=False)
         .agg(
             association_score=("association_score", "max"),
-            pathway=(
-                "pathway",
-                lambda s: "; ".join(sorted({v for v in s if v})),
-            ),
+            pathway=("pathway", lambda s: "; ".join(sorted({v for v in s if v}))),
             pdb_id=("pdb_id", lambda s: next((v for v in s if v), "")),
         )
     )
@@ -496,145 +515,109 @@ def run_screening_from_uploads(
           "target_coverage": (w_hit / total_w) if total_w else 0.0,
       })
 
-    scored = pd.concat(
-        [drugs.reset_index(drop=True), pd.DataFrame(matched_rows)], axis=1
-    )
+    scored = pd.concat([drugs.reset_index(drop=True), pd.DataFrame(matched_rows)], axis=1)
     cands = scored[scored["drug_name"].ne(selected_ref)].copy()
     cands["screening_score"] = np.where(
         cands["chemical_similarity"].isna(),
         cands["target_coverage"],
-        TARGET_WEIGHT * cands["target_coverage"]
-        + CHEMICAL_WEIGHT * cands["chemical_similarity"],
+        target_weight * cands["target_coverage"] + chem_weight * cands["chemical_similarity"],
     )
-    ranked = (
-        cands.sort_values(
-            ["screening_score", "target_coverage", "chemical_similarity"],
-            ascending=False,
-            na_position="last",
-        )
-        .reset_index(drop=True)
-    )
+    ranked = cands.sort_values(
+        ["screening_score", "target_coverage", "chemical_similarity"],
+        ascending=False,
+        na_position="last",
+    ).reset_index(drop=True)
     ranked.insert(0, "rank", np.arange(1, len(ranked) + 1))
 
     physicochem_df = build_physicochemical_table(scored)
     provenance_df = pd.DataFrame([{
-        "timestamp_utc": datetime.datetime.now(
-            datetime.timezone.utc
-        ).isoformat(),
+        "timestamp_utc": datetime.datetime.now(datetime.timezone.utc).isoformat(),
         "disease": selected_disease,
         "reference_drug": selected_ref,
-        "target_weight": TARGET_WEIGHT,
-        "chemical_weight": CHEMICAL_WEIGHT,
+        "target_weight": target_weight,
+        "chemical_weight": chem_weight,
         "fingerprint": "Morgan(radius=2, nBits=2048)",
         "drugs_screened": len(ranked),
         "disease_targets": len(gene_weights),
-        "top_candidate": (
-            ranked.iloc[0]["drug_name"] if len(ranked) else "None"
-        ),
-        "disclaimer": (
-            "Computational research shortlist only; experimental/clinical"
-            " validation required."
-        ),
+        "top_candidate": ranked.iloc[0]["drug_name"] if len(ranked) else "None",
+        "disclaimer": "Computational research shortlist only; experimental/clinical validation required.",
     }])
 
-    pipeline_outputs.update({
-        "drugs": scored,
-        "disease_targets": dt,
+    st.session_state["screening_result"] = {
+        "scored": scored,
         "ranked": ranked,
-        "physicochemical": physicochem_df,
-        "provenance": provenance_df,
-        "disease_choice": selected_disease,
-        "reference_drug": selected_ref,
-    })
+        "dt": dt,
+        "physicochem_df": physicochem_df,
+        "provenance_df": provenance_df,
+        "selected_disease": selected_disease,
+        "selected_ref": selected_ref,
+        "target_weight": target_weight,
+        "chem_weight": chem_weight,
+        "top_3d_n": top_3d_n,
+    }
 
-    print("### 1. Ranked Candidates")
-    display(
-        ranked[[
-            "rank",
-            "drug_name",
-            "chemical_similarity",
-            "target_coverage",
-            "screening_score",
-            "matched_targets",
-        ]]
-    )
+res = st.session_state.get("screening_result")
+if res:
+  scored = res["scored"]
+  ranked = res["ranked"]
+  dt = res["dt"]
+  physicochem_df = res["physicochem_df"]
+  provenance_df = res["provenance_df"]
+  selected_disease = res["selected_disease"]
+  selected_ref = res["selected_ref"]
 
-    print("### 2. Physicochemical & Lipinski Properties")
-    display(physicochem_df)
-
-    print("### 3. Diagnostic Charts")
-    plot_researcher_charts(
-        ranked, selected_ref, selected_disease, TARGET_WEIGHT, CHEMICAL_WEIGHT
-    )
-
-    print("### 4. Interactive Rotatable 3D Structures (No Background)")
-    _render_side_by_side_3d_no_bg(scored, ranked, selected_ref, top_n=3)
-
-    print("### 5. Run Provenance & Exports")
-    display(provenance_df)
-    _export_results(
-        ranked[[
-            "rank",
-            "drug_name",
-            "smiles",
-            "approval_status",
-            "source",
-            "chemical_similarity",
-            "target_coverage",
-            "screening_score",
-            "matched_targets",
-        ]],
-        physicochem_df,
-        provenance_df,
-    )
-
-
-uploader = widgets.FileUpload(
-    accept="",
-    multiple=True,
-    description="Upload File(s)",
-    button_style="primary",
-)
-run_btn = widgets.Button(
-    description="Run Screening",
-    button_style="success",
-    icon="play",
-)
-file_status = widgets.HTML("<i>No files uploaded yet.</i>")
-results_box = widgets.Output()
-
-
-def _handle_upload(change):
-  val = change["new"]
-  items = list(val.values()) if isinstance(val, dict) else list(val)
-  for item in items:
-    fname = item.get("name", "uploaded_file")
-    content = item.get("content", b"")
-    if isinstance(content, memoryview):
-      content = content.tobytes()
-    upload_state["files"][fname] = bytes(content)
-  file_status.value = (
-      f"<b>Uploaded ({len(upload_state['files'])}):</b> "
-      + ", ".join(upload_state["files"].keys())
+  st.subheader("1. Ranked Candidates")
+  st.dataframe(
+      ranked[["rank", "drug_name", "chemical_similarity", "target_coverage", "screening_score", "matched_targets"]],
+      use_container_width=True,
   )
 
+  st.subheader("2. Physicochemical & Lipinski Properties")
+  st.dataframe(physicochem_df, use_container_width=True)
 
-def _handle_run(_btn):
-  with results_box:
-    clear_output(wait=True)
-    try:
-      run_screening_from_uploads(out_widget=results_box)
-    except Exception as exc:
-      print(f"Error while running pipeline: {exc}")
+  st.subheader("3. Diagnostic Charts")
+  fig = make_charts(ranked, selected_ref, selected_disease, res["target_weight"], res["chem_weight"])
+  st.pyplot(fig)
 
+  st.subheader("4. Side-by-Side Interactive 3D Structures (No Background)")
+  render_side_by_side_3d(scored, ranked, selected_ref, top_n=res["top_3d_n"])
 
-uploader.observe(_handle_upload, names="value")
-run_btn.on_click(_handle_run)
+  st.subheader("5. Best Route Finder (Drug → Target → Pathway / Disease)")
+  graph = build_route_graph(scored, dt)
+  all_nodes = sorted(graph.nodes)
+  if all_nodes:
+    r_col1, r_col2 = st.columns(2)
+    default_src = ranked.iloc[0]["drug_name"] if len(ranked) else all_nodes[0]
+    src_idx = all_nodes.index(default_src) if default_src in all_nodes else 0
+    tgt_idx = all_nodes.index(selected_disease) if selected_disease in all_nodes else 0
+    with r_col1:
+      src_node = st.selectbox("Source Node", all_nodes, index=src_idx, key="route_src")
+    with r_col2:
+      tgt_node = st.selectbox("Target Node", all_nodes, index=tgt_idx, key="route_tgt")
 
-display(
-    widgets.VBox([
-        widgets.HBox([uploader, run_btn]),
-        file_status,
-        results_box,
-    ])
-)
+    route_info = find_best_route(graph, src_node, tgt_node)
+    if route_info["found"]:
+      st.success(f"**Best Route:** {' → '.join(route_info['route'])} (Total Cost: `{route_info['total_cost']}`)")
+      st.dataframe(pd.DataFrame(route_info["steps"]), use_container_width=True)
+    else:
+      st.info("No directed route connects the selected source and target nodes.")
+
+  st.subheader("6. Run Provenance & Download Bundle")
+  st.dataframe(provenance_df, use_container_width=True)
+
+  zip_buf = io.BytesIO()
+  with zipfile.ZipFile(zip_buf, "w", zipfile.ZIP_DEFLATED) as zf:
+    zf.writestr(
+        "LITMUS_ranked_candidates.csv",
+        ranked[["rank", "drug_name", "smiles", "approval_status", "source", "chemical_similarity", "target_coverage", "screening_score", "matched_targets"]].to_csv(index=False),
+    )
+    zf.writestr("LITMUS_physicochemical_properties.csv", physicochem_df.to_csv(index=False))
+    zf.writestr("LITMUS_run_provenance.csv", provenance_df.to_csv(index=False))
+  zip_buf.seek(0)
+
+  st.download_button(
+      label="Download Results Bundle (.ZIP)",
+      data=zip_buf,
+      file_name="LITMUS_research_bundle.zip",
+      mime="application/zip",
+  )
