@@ -22,7 +22,7 @@ from rdkit.Chem import (
 )
 
 st.set_page_config(
-    page_title="Virtual Screening & 3D Structure Explorer",
+    page_title="Drug Repurposing",
     page_icon="🧪",
     layout="wide",
 )
