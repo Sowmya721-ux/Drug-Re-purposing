@@ -1,6 +1,7 @@
 import datetime
 import io
 import json
+import math
 import re
 import zipfile
 import networkx as nx
@@ -321,7 +322,7 @@ def render_side_by_side_3d(
     sim = sim_map.get(name)
     sim_str = f" | Sim: {sim:.2f}" if sim is not None and sim == sim else ""
 
-    v = py3Dmol.view(width=300, height=250)
+    v = py3Dmol.view(width=255, height=215)
     v.addModel(sdf_block, "sdf")
     v.setStyle({
         "stick": {"radius": 0.18, "colorscheme": "Jmol"},
@@ -332,7 +333,7 @@ def render_side_by_side_3d(
     viewer_html = v._make_html()
 
     cards.append(
-        f"<div style='width:315px; background:transparent; padding:4px;'>"
+        f"<div style='width:270px; background:transparent; padding:4px;'>"
         f"<div style='text-align:center; font-size:12px; margin-bottom:4px; background:transparent;'>"
         f"<b>{role}: {name}</b>{sim_str}<br>"
         f"<span style='opacity:0.75;'>Drag to rotate · Scroll to zoom</span></div>"
@@ -344,12 +345,17 @@ def render_side_by_side_3d(
     st.info("No 3D conformers could be generated for display.")
     return
 
+  # Estimate rows assuming ~3-4 cards per wide row; add extra buffer so nothing clips
+  per_row = 3
+  num_rows = math.ceil(len(cards) / per_row)
+  iframe_height = max(310, num_rows * 290 + 30)
+
   full_html = (
       "<div style='display:flex; flex-wrap:wrap; gap:10px; background:transparent;'>"
       + "".join(cards)
       + "</div>"
   )
-  components.html(full_html, height=320, scrolling=False)
+  components.html(full_html, height=iframe_height, scrolling=True)
 
 
 def build_route_graph(drugs_df: pd.DataFrame, dt_df: pd.DataFrame) -> nx.DiGraph:
