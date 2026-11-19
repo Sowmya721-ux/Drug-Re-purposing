@@ -156,8 +156,7 @@ def _txt(x) -> str:
 
 
 def _canon_col(name: str) -> str:
-  s = re.sub(r"[^a-z0-9]+", "_", str(name).strip().lower()).strip("_")
-  return s
+  return re.sub(r"[^a-z0-9]+", "_", str(name).strip().lower()).strip("_")
 
 
 def _norm_gene(symbol: str) -> str:
@@ -621,4 +620,137 @@ if st.button("Run Screening", type="primary"):
     fpgen = rdFingerprintGenerator.GetMorganGenerator(radius=2, fpSize=2048)
     drugs["mol"] = drugs["smiles"].map(lambda s: Chem.MolFromSmiles(s) if s else None)
     drugs["fingerprint"] = drugs["mol"].map(
-        lambda m: fpgen.Get
+        lambda m: fpgen.GetFingerprint(m) if m is not None else None
+    )
+
+    ref_fp = drugs.loc[drugs["drug_name"].eq(selected_ref), "fingerprint"].iloc[0]
+    if ref_fp is None:
+      drugs["chemical_similarity"] = np.nan
+    else:
+      drugs["chemical_similarity"] = drugs["fingerprint"].map(
+          lambda fp: float(DataStructs.TanimotoSimilarity(ref_fp, fp)) if fp is not None else np.nan
+      )
+
+    d_sub = (
+        dt[dt["disease"].eq(selected_disease)]
+        .groupby("gene", as_index=False)
+        .agg(
+            association_score=("association_score", "max"),
+            pathway=("pathway", lambda s: "; ".join(sorted({v for v in s if v}))),
+            pdb_id=("pdb_id", lambda s: next((v for v in s if v), "")),
+        )
+    )
+    gene_weights = dict(zip(d_sub["gene"], d_sub["association_score"]))
+    total_w = sum(gene_weights.values())
+
+    matched_rows = []
+    for tset in drugs["targets_set"]:
+      matched = sorted(tset & set(gene_weights))
+      w_hit = sum(gene_weights[g] for g in matched)
+      matched_rows.append({
+          "matched_targets": "; ".join(matched),
+          "matched_target_count": len(matched),
+          "target_coverage": (w_hit / total_w) if total_w else 0.0,
+      })
+
+    scored = pd.concat([drugs.reset_index(drop=True), pd.DataFrame(matched_rows)], axis=1)
+    physicochem_df = build_physicochemical_table(scored)
+
+    st.session_state["screening_result"] = {
+        "scored": scored,
+        "dt": dt,
+        "physicochem_df": physicochem_df,
+        "selected_disease": selected_disease,
+        "selected_ref": selected_ref,
+        "gene_target_count": len(gene_weights),
+    }
+
+res = st.session_state.get("screening_result")
+if res:
+  scored = res["scored"]
+  dt = res["dt"]
+  physicochem_df = res["physicochem_df"]
+  selected_disease = res["selected_disease"]
+  selected_ref = res["selected_ref"]
+
+  cands = scored[scored["drug_name"].ne(selected_ref)].copy()
+  cands["screening_score"] = np.where(
+      cands["chemical_similarity"].isna(),
+      cands["target_coverage"],
+      target_weight * cands["target_coverage"] + chem_weight * cands["chemical_similarity"],
+  )
+  ranked = cands.sort_values(
+      ["screening_score", "target_coverage", "chemical_similarity"],
+      ascending=False,
+      na_position="last",
+  ).reset_index(drop=True)
+  ranked.insert(0, "rank", np.arange(1, len(ranked) + 1))
+
+  provenance_df = pd.DataFrame([{
+      "timestamp_utc": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+      "disease": selected_disease,
+      "reference_drug": selected_ref,
+      "target_weight": target_weight,
+      "chemical_weight": chem_weight,
+      "fingerprint": "Morgan(radius=2, nBits=2048)",
+      "drugs_screened": len(ranked),
+      "disease_targets": res["gene_target_count"],
+      "top_candidate": ranked.iloc[0]["drug_name"] if len(ranked) else "None",
+      "disclaimer": "Computational research shortlist only; experimental/clinical validation required.",
+  }])
+
+  st.subheader("1. Ranked Candidates")
+  st.dataframe(
+      ranked[["rank", "drug_name", "chemical_similarity", "target_coverage", "screening_score", "matched_targets"]],
+      use_container_width=True,
+  )
+
+  st.subheader("2. Physicochemical & Lipinski Properties")
+  st.dataframe(physicochem_df, use_container_width=True)
+
+  st.subheader("3. Diagnostic Charts")
+  fig = make_charts(ranked, selected_ref, selected_disease, target_weight, chem_weight)
+  st.pyplot(fig)
+
+  st.subheader("4. Chemical structures")
+  render_side_by_side_3d(scored, ranked, selected_ref, top_n=5)
+
+  st.subheader("5. Best Route Finder (Drug → Target → Pathway / Disease)")
+  graph = build_route_graph(scored, dt)
+  all_nodes = sorted(graph.nodes)
+  if all_nodes:
+    r_col1, r_col2 = st.columns(2)
+    default_src = ranked.iloc[0]["drug_name"] if len(ranked) else all_nodes[0]
+    src_idx = all_nodes.index(default_src) if default_src in all_nodes else 0
+    tgt_idx = all_nodes.index(selected_disease) if selected_disease in all_nodes else 0
+    with r_col1:
+      src_node = st.selectbox("Source Node", all_nodes, index=src_idx, key="route_src")
+    with r_col2:
+      tgt_node = st.selectbox("Target Node", all_nodes, index=tgt_idx, key="route_tgt")
+
+    route_info = find_best_route(graph, src_node, tgt_node)
+    if route_info["found"]:
+      st.success(f"**Best Route:** {' → '.join(route_info['route'])} (Total Cost: `{route_info['total_cost']}`)")
+      st.dataframe(pd.DataFrame(route_info["steps"]), use_container_width=True)
+    else:
+      st.info("No directed route connects the selected source and target nodes.")
+
+  st.subheader("6. Run Provenance & Download Bundle")
+  st.dataframe(provenance_df, use_container_width=True)
+
+  zip_buf = io.BytesIO()
+  with zipfile.ZipFile(zip_buf, "w", zipfile.ZIP_DEFLATED) as zf:
+    zf.writestr(
+        "LITMUS_ranked_candidates.csv",
+        ranked[["rank", "drug_name", "smiles", "approval_status", "source", "chemical_similarity", "target_coverage", "screening_score", "matched_targets"]].to_csv(index=False),
+    )
+    zf.writestr("LITMUS_physicochemical_properties.csv", physicochem_df.to_csv(index=False))
+    zf.writestr("LITMUS_run_provenance.csv", provenance_df.to_csv(index=False))
+  zip_buf.seek(0)
+
+  st.download_button(
+      label="Download Results Bundle (.ZIP)",
+      data=zip_buf,
+      file_name="LITMUS_research_bundle.zip",
+      mime="application/zip",
+  )
