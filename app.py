@@ -314,9 +314,11 @@ def render_side_by_side_3d(
   ]
 
   cards = []
+  skipped = []
   for name in names_3d:
     sdf_block = build_3d_sdf_block(mol_map.get(name))
     if not sdf_block:
+      skipped.append(name)
       continue
     role = "Reference" if name == selected_ref else "Candidate"
     sim = sim_map.get(name)
@@ -345,10 +347,12 @@ def render_side_by_side_3d(
     st.info("No 3D conformers could be generated for display.")
     return
 
-  # Estimate rows assuming ~3-4 cards per wide row; add extra buffer so nothing clips
-  per_row = 3
+  if skipped:
+    st.caption(f"Skipped 3D conformer generation for: {', '.join(skipped)}")
+
+  per_row = 2
   num_rows = math.ceil(len(cards) / per_row)
-  iframe_height = max(310, num_rows * 290 + 30)
+  iframe_height = max(320, num_rows * 300 + 30)
 
   full_html = (
       "<div style='display:flex; flex-wrap:wrap; gap:10px; background:transparent;'>"
