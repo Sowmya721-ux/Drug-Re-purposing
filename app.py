@@ -411,7 +411,7 @@ def find_best_route(g: nx.DiGraph, source: str, target: str) -> dict:
 # ==============================================================================
 # UI & EXECUTION
 # ==============================================================================
-st.title("🧪 Virtual Screening & 3D Structure Explorer")
+st.title("🧪 Drug Repurposing")
 st.caption(
     "Upload any dataset format or use built-in demo data to rank candidates,"
     " inspect Lipinski descriptors, view diagnostic charts, and rotate 3D conformers side by side."
