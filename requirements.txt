@@ -1,0 +1,9 @@
+streamlit
+numpy
+pandas
+matplotlib
+requests
+rdkit
+py3Dmol
+openpyxl
+networkx
